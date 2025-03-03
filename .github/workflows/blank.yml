@@ -1,0 +1,95 @@
+name: CI/CD Pipeline for Pod Info
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ap-south-1
+      EKS_CLUSTER: my-eks-cluster
+      IMAGE_NAME: podinfo
+      IMAGE_TAG: latest
+      DOCKER_REGISTRY: DOCKERHUB_USERNAME/podinfo
+      VAULT_ADDR: http://your-vault-server:8200
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Run Static Code Analysis (SAST)
+        uses: github/codeql-action/init@v2
+        with:
+          languages: javascript,go
+      
+      - name: Run Secret Scanning
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          config-path: ".gitleaks.toml"
+      
+      - name: Build Docker Image
+        run: |
+          docker build -t $DOCKER_REGISTRY:$IMAGE_TAG .
+      
+      - name: Scan Docker Image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "$DOCKER_REGISTRY:$IMAGE_TAG"
+          exit-code: 1
+          severity: "HIGH,CRITICAL"
+      
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+      
+      - name: Push Image to Docker Hub
+        run: docker push $DOCKER_REGISTRY:$IMAGE_TAG
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: $AWS_REGION
+      
+      - name: Deploy Infrastructure using Terraform
+        run: |
+          cd infrastructure
+          terraform init
+          terraform apply -auto-approve
+      
+      - name: Deploy to Kubernetes using Helm
+        run: |
+          aws eks update-kubeconfig --name $EKS_CLUSTER --region $AWS_REGION
+          helm upgrade --install podinfo ./helm-chart
+      
+      - name: Run Dynamic Security Testing (DAST)
+        run: |
+          docker run -t owasp/zap2docker-stable zap-baseline.py -t http://your-app-url -r zap_report.html
+      
+      - name: Upload DAST Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: ZAP-Report
+          path: zap_report.html      
+      - name: Secure Secrets with HashiCorp Vault
+        run: |
+          export VAULT_TOKEN=$(vault login -method=github token=${{ secrets.VAULT_GITHUB_TOKEN }})
+          vault kv get secret/data/app-secrets
+      
+      - name: Apply Kubernetes RBAC Policies
+        run: |
+          kubectl apply -f rbac-config.yaml
+      
+      - name: Notify on Failure
+        if: failure()
+        run: echo "Build failed, check logs."
